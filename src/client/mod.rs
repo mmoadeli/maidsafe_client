@@ -15,6 +15,8 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+#![allow(unsafe_code)]
+
 use cbor;
 use rand::Rng;
 use crypto::buffer::ReadBuffer;
@@ -23,49 +25,75 @@ use crypto::buffer::WriteBuffer;
 use routing;
 use maidsafe_types;
 use maidsafe_types::TypeTag;
-use maidsafe_types::data::{ImmutableDataTypeTag};
 use routing::sendable::Sendable;
-
-pub mod non_networking_test_framework;
 
 mod user_account;
 mod response_getter;
 mod callback_interface;
 
+#[cfg(not(feature = "USE_ACTUAL_ROUTING"))]
+mod non_networking_test_framework;
+#[cfg(not(feature = "USE_ACTUAL_ROUTING"))]
+type RoutingClient = ::std::sync::Arc<::std::sync::Mutex<non_networking_test_framework::RoutingClientMock>>;
+#[cfg(not(feature = "USE_ACTUAL_ROUTING"))]
+fn get_new_routing_client(cb_interface: ::std::sync::Arc<::std::sync::Mutex<callback_interface::CallbackInterface>>, id_packet: routing::types::Id) -> RoutingClient {
+    ::std::sync::Arc::new(::std::sync::Mutex::new(non_networking_test_framework::RoutingClientMock::new(cb_interface, id_packet)))
+}
+
+#[cfg(feature = "USE_ACTUAL_ROUTING")]
+type RoutingClient = ::std::sync::Arc<::std::sync::Mutex<routing::routing_client::RoutingClient<callback_interface::CallbackInterface>>>;
+#[cfg(feature = "USE_ACTUAL_ROUTING")]
+fn get_new_routing_client(cb_interface: ::std::sync::Arc<::std::sync::Mutex<callback_interface::CallbackInterface>>, id_packet: routing::types::Id) -> RoutingClient {
+    ::std::sync::Arc::new(::std::sync::Mutex::new(routing::routing_client::RoutingClient::new(cb_interface, id_packet)))
+}
+
+mod misc {
+    pub type ResponseNotifier = ::std::sync::Arc<(::std::sync::Mutex<::routing::types::MessageId>, ::std::sync::Condvar)>;
+}
+
+/// The main self-authentication client instance that will interface all the request from high
+/// level API's to the actual routing layer and manage all interactions with it. This is
+/// essentially a non-blocking Client with upper layers having an option to either block and wait
+/// on the returned ResponseGetter for receiving network response or spawn a new thread. The Client
+/// itself is however well equipped for parallel and non-blocking PUTs and GETS.
 pub struct Client {
     account:             user_account::Account,
-    //TODO: Toggle depending on if using actual routing or non_networking_test_framework
-    // routing:             ::std::sync::Arc<::std::sync::Mutex<routing::routing_client::RoutingClient<callback_interface::CallbackInterface>>>,
-    routing:             ::std::sync::Arc<::std::sync::Mutex<non_networking_test_framework::RoutingClientMock>>,
-    response_notifier:   ::ResponseNotifier,
+    session_packet_id:   ::routing::NameType,
+    session_packet_keys: SessionPacketEncryptionKeys,
+    routing:             RoutingClient,
+    response_notifier:   misc::ResponseNotifier,
     callback_interface:  ::std::sync::Arc<::std::sync::Mutex<callback_interface::CallbackInterface>>,
     routing_stop_flag:   ::std::sync::Arc<::std::sync::Mutex<bool>>,
     routing_join_handle: Option<::std::thread::JoinHandle<()>>,
 }
 
 impl Client {
-    //TODO: data_store parameter should be removed when not testing with non_networking_test_framework.
-    pub fn create_account(keyword: &String, pin: u32, password: &[u8], data_store: non_networking_test_framework::DataStore) -> Result<Client, ::IoError> {
+    /// This is one of the two Gateway functions to the Maidsafe network, the other being the
+    /// log_in. This will help create a fresh account for the user in the SAFE-network.
+    pub fn create_account(keyword: &String, pin: u32, password_str: &String) -> Result<Client, ::IoError> {
+        let password = password_str.as_bytes();
+
         let notifier = ::std::sync::Arc::new((::std::sync::Mutex::new(0), ::std::sync::Condvar::new()));
         let account_packet = user_account::Account::new(None);
         let callback_interface = ::std::sync::Arc::new(::std::sync::Mutex::new(callback_interface::CallbackInterface::new(notifier.clone())));
-        let _ = routing::routing_client::ClientIdPacket::new(account_packet.get_maid().public_keys().clone(),
-                                                             account_packet.get_maid().secret_keys().clone());
+        let id_packet = routing::types::Id::with_keys(account_packet.get_maid().public_keys().clone(),
+                                                      account_packet.get_maid().secret_keys().clone());
 
-        //TODO: Toggle depending on if using actual routing or non_networking_test_framework
-        // let routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(routing::routing_client::RoutingClient::new(callback_interface.clone(), client_id_packet)));
-        let routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(non_networking_test_framework::RoutingClientMock::new(callback_interface.clone(), data_store)));
+        let routing_client = get_new_routing_client(callback_interface.clone(), id_packet);
         let cloned_routing_client = routing_client.clone();
         let routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
         let routing_stop_flag_clone = routing_stop_flag.clone();
 
         let client = Client {
             account: account_packet,
+            session_packet_id: user_account::Account::generate_network_id(keyword, pin),
+            session_packet_keys: SessionPacketEncryptionKeys::new(password, pin),
             routing: routing_client,
             callback_interface: callback_interface,
             response_notifier: notifier,
             routing_stop_flag: routing_stop_flag,
             routing_join_handle: Some(::std::thread::spawn(move || {
+                let _ = cloned_routing_client.lock().unwrap().bootstrap(None, None);
                 while !*routing_stop_flag_clone.lock().unwrap() {
                     ::std::thread::sleep_ms(10);
                     cloned_routing_client.lock().unwrap().run();
@@ -79,50 +107,51 @@ impl Client {
             let _ = client.routing.lock().unwrap().unauthorised_put(destination, boxed_public_maid);
         }
 
-        let encrypted_account = maidsafe_types::ImmutableData::new(client.account.encrypt(&password, pin).ok().unwrap());
+        let encrypted_account = maidsafe_types::ImmutableData::new(client.account.encrypt(password, pin).ok().unwrap());
         let put_res = client.routing.lock().unwrap().put(encrypted_account.clone());
         match put_res {
             Ok(id) => {
                 let mut response_getter = response_getter::ResponseGetter::new(client.response_notifier.clone(), client.callback_interface.clone(), Some(id), None);
                 match response_getter.get() {
-                    Ok(_) => {},
-                    Err(_) => return Err(::IoError::new(::std::io::ErrorKind::Other, "Session-Packet PUT-Response Failure !!")),
-                }
+                    Ok(_) => {
+                        let account_versions = maidsafe_types::StructuredData::new(client.session_packet_id.clone(),
+                                                                                   client.account.get_public_maid().name(),
+                                                                                   vec![encrypted_account.name()]);
 
-                let account_version = maidsafe_types::StructuredData::new(user_account::Account::generate_network_id(&keyword, pin),
-                                                                          client.account.get_public_maid().name(),
-                                                                          vec![encrypted_account.name()]);
-                let put_res = client.routing.lock().unwrap().put(account_version);
+                        let put_res = client.routing.lock().unwrap().put(account_versions);
 
-                match put_res {
-                    Ok(id) => {
-                        let mut response_getter = response_getter::ResponseGetter::new(client.response_notifier.clone(), client.callback_interface.clone(), Some(id), None);
-                        match response_getter.get() {
-                            Ok(_) => {},
-                            Err(_) => return Err(::IoError::new(::std::io::ErrorKind::Other, "Version-Packet PUT-Response Failure !!")),
+                        match put_res {
+                            Ok(id) => {
+                                let mut response_getter = response_getter::ResponseGetter::new(client.response_notifier.clone(), client.callback_interface.clone(), Some(id), None);
+                                match response_getter.get() {
+                                    Ok(_) => Ok(client),
+                                    Err(_) => Err(::IoError::new(::std::io::ErrorKind::Other, "Version-Packet PUT-Response Failure !!")),
+                                }
+                            },
+                            Err(io_error) => Err(io_error),
                         }
-
-                        Ok(client)
                     },
-                    Err(io_error) => Err(io_error),
+                    Err(_) => Err(::IoError::new(::std::io::ErrorKind::Other, "Session-Packet PUT-Response Failure !!")),
                 }
             },
             Err(io_error) => Err(io_error),
         }
     }
 
-    //TODO: data_store parameter should be removed when not testing with non_networking_test_framework.
-    pub fn log_in(keyword: &String, pin: u32, password: &[u8], data_store: non_networking_test_framework::DataStore) -> Result<Client, ::IoError> {
+    /// This is one of the two Gateway functions to the Maidsafe network, the other being the
+    /// create_account. This will help log into an already created account for the user in the
+    /// SAFE-network.
+    pub fn log_in(keyword: &String, pin: u32, password_str: &String) -> Result<Client, ::IoError> {
+        let password = password_str.as_bytes();
+
         let notifier = ::std::sync::Arc::new((::std::sync::Mutex::new(0), ::std::sync::Condvar::new()));
         let user_network_id = user_account::Account::generate_network_id(keyword, pin);
         let fake_account_packet = user_account::Account::new(None);
         let callback_interface = ::std::sync::Arc::new(::std::sync::Mutex::new(callback_interface::CallbackInterface::new(notifier.clone())));
-        let _ = routing::routing_client::ClientIdPacket::new(fake_account_packet.get_maid().public_keys().clone(),
-                                                             fake_account_packet.get_maid().secret_keys().clone());
+        let fake_id_packet = routing::types::Id::with_keys(fake_account_packet.get_maid().public_keys().clone(),
+                                                           fake_account_packet.get_maid().secret_keys().clone());
 
-        //TODO: Toggle depending on if using actual routing or non_networking_test_framework
-        // let fake_routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(routing::routing_client::RoutingClient::new(callback_interface.clone(), fake_client_id_packet)));
-        let fake_routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(non_networking_test_framework::RoutingClientMock::new(callback_interface.clone(), data_store.clone())));
+        let fake_routing_client = get_new_routing_client(callback_interface.clone(), fake_id_packet);
         let cloned_fake_routing_client = fake_routing_client.clone();
         let fake_routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
         let fake_routing_stop_flag_clone = fake_routing_stop_flag.clone();
@@ -142,6 +171,7 @@ impl Client {
         let _managed_thread = RAIIThreadExit {
             routing_stop_flag: fake_routing_stop_flag,
             join_handle: Some(::std::thread::spawn(move || {
+                let _ = cloned_fake_routing_client.lock().unwrap().bootstrap(None, None);
                 while !*fake_routing_stop_flag_clone.lock().unwrap() {
                     ::std::thread::sleep_ms(10);
                     cloned_fake_routing_client.lock().unwrap().run();
@@ -149,7 +179,7 @@ impl Client {
             })),
         };
 
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
         let get_result = fake_routing_client.lock().unwrap().get(structured_data_type_id.type_tag(), user_network_id);
 
         match get_result {
@@ -158,11 +188,11 @@ impl Client {
                 match response_getter.get() {
                     Ok(raw_data) => {
                         let mut decoder = cbor::Decoder::from_bytes(raw_data);
-                        let account_version: maidsafe_types::StructuredData = decoder.decode().next().unwrap().unwrap();
+                        let account_versions: maidsafe_types::StructuredData = decoder.decode().next().unwrap().unwrap();
 
-                        match account_version.value().pop() {
+                        match account_versions.value().pop() {
                             Some(latest_version) => {
-                                let immutable_data_type_id: maidsafe_types::data::ImmutableDataTypeTag = unsafe { ::std::mem::uninitialized() };
+                                let immutable_data_type_id = maidsafe_types::data::ImmutableDataTypeTag;
                                 let get_result = fake_routing_client.lock().unwrap().get(immutable_data_type_id.type_tag(), latest_version);
                                 match get_result {
                                     Ok(id) => {
@@ -172,29 +202,30 @@ impl Client {
                                                 let mut decoder = cbor::Decoder::from_bytes(raw_data);
                                                 let encrypted_account_packet: maidsafe_types::ImmutableData = decoder.decode().next().unwrap().unwrap();
 
-                                                let decryption_result = user_account::Account::decrypt(&encrypted_account_packet.value()[..], &password, pin);
+                                                let decryption_result = user_account::Account::decrypt(&encrypted_account_packet.value()[..], password, pin);
                                                 if decryption_result.is_err() {
                                                     return Err(::IoError::new(::std::io::ErrorKind::Other, "Could Not Decrypt Session Packet !! (Probably Wrong Password)"));
                                                 }
                                                 let account_packet = decryption_result.ok().unwrap();
 
-                                                let _ = routing::routing_client::ClientIdPacket::new(account_packet.get_maid().public_keys().clone(),
-                                                                                                     account_packet.get_maid().secret_keys().clone());
+                                                let id_packet = routing::types::Id::with_keys(account_packet.get_maid().public_keys().clone(),
+                                                                                              account_packet.get_maid().secret_keys().clone());
 
-                                                //TODO: Toggle depending on if using actual routing or non_networking_test_framework
-                                                // let routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(routing::routing_client::RoutingClient::new(callback_interface.clone(), client_id_packet)));
-                                                let routing_client = ::std::sync::Arc::new(::std::sync::Mutex::new(non_networking_test_framework::RoutingClientMock::new(callback_interface.clone(), data_store)));
+                                                let routing_client = get_new_routing_client(callback_interface.clone(), id_packet);
                                                 let cloned_routing_client = routing_client.clone();
                                                 let routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
                                                 let routing_stop_flag_clone = routing_stop_flag.clone();
 
                                                 let client = Client {
                                                     account: account_packet,
+                                                    session_packet_id: user_account::Account::generate_network_id(keyword, pin),
+                                                    session_packet_keys: SessionPacketEncryptionKeys::new(password, pin),
                                                     routing: routing_client,
                                                     callback_interface: callback_interface,
                                                     response_notifier: notifier,
                                                     routing_stop_flag: routing_stop_flag,
                                                     routing_join_handle: Some(::std::thread::spawn(move || {
+                                                        let _ = cloned_routing_client.lock().unwrap().bootstrap(None, None);
                                                         while !*routing_stop_flag_clone.lock().unwrap() {
                                                             ::std::thread::sleep_ms(10);
                                                             cloned_routing_client.lock().unwrap().run();
@@ -220,6 +251,74 @@ impl Client {
         }
     }
 
+    /// Create an entry for the Root Directory ID for the user into the session packet, encrypt and
+    /// store it. It will be retireved when the user logs into his account. Root directory ID is
+    /// necessary to fetch all of user's data as all further data is encoded as meta-information
+    /// into the Root Directory or one of its subdirectories.
+    pub fn set_root_directory_id(&mut self, root_dir_id: routing::NameType) -> Result<(), ::IoError> {
+        if self.account.set_root_dir_id(root_dir_id.clone()) {
+            let encrypted_account = maidsafe_types::ImmutableData::new(self.account.encrypt(self.session_packet_keys.get_password(), self.session_packet_keys.get_pin()).ok().unwrap());
+            let put_res = self.routing.lock().unwrap().put(encrypted_account.clone());
+            match put_res {
+                Ok(id) => {
+                    let mut response_getter = response_getter::ResponseGetter::new(self.response_notifier.clone(), self.callback_interface.clone(), Some(id), None);
+                    match response_getter.get() {
+                        Ok(_) => {},
+                        Err(_) => return Err(::IoError::new(::std::io::ErrorKind::Other, "Session-Packet PUT-Response Failure !!")),
+                    }
+
+                    let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
+                    let get_result = self.routing.lock().unwrap().get(structured_data_type_id.type_tag(), self.session_packet_id.clone());
+
+                    match get_result {
+                        Ok(id) => {
+                            let mut response_getter = response_getter::ResponseGetter::new(self.response_notifier.clone(), self.callback_interface.clone(), Some(id), None);
+                            match response_getter.get() {
+                                Ok(raw_data) => {
+                                    let mut decoder = cbor::Decoder::from_bytes(raw_data);
+                                    let account_versions: maidsafe_types::StructuredData = decoder.decode().next().unwrap().unwrap();
+                                    let mut vec_accounts = account_versions.value();
+                                    vec_accounts.push(encrypted_account.name());
+
+                                    let new_account_versions = maidsafe_types::StructuredData::new(self.session_packet_id.clone(),
+                                                                                                   self.account.get_public_maid().name(),
+                                                                                                   vec_accounts);
+
+                                    let put_res = self.routing.lock().unwrap().put(new_account_versions);
+
+                                    match put_res {
+                                        Ok(id) => {
+                                            let mut response_getter = response_getter::ResponseGetter::new(self.response_notifier.clone(), self.callback_interface.clone(), Some(id), None);
+                                            match response_getter.get() {
+                                                Ok(_) => Ok(()),
+                                                Err(_) => Err(::IoError::new(::std::io::ErrorKind::Other, "Version-Packet PUT-Response Failure !!")),
+                                            }
+                                        },
+                                        Err(io_error) => Err(io_error),
+                                    }
+                                },
+                                Err(_) => Err(::IoError::new(::std::io::ErrorKind::Other, "SD-GET-Resp Failure - Could Not Retrieve Existing Account Versions !!")),
+                            }
+                        },
+                        Err(io_error) => Err(io_error),
+                    }
+                },
+                Err(io_error) => Err(io_error),
+            }
+        } else {
+            Err(::IoError::new(::std::io::ErrorKind::Other, "Root Directory Id Set-Failure (Possibly already Exists - Do a get) !!"))
+        }
+    }
+
+    /// Get Root Directory ID if available in session packet used for current login
+    pub fn get_root_directory_id(&self) -> Option<&routing::NameType> {
+        self.account.get_root_dir_id()
+    }
+
+    /// Combined Asymmectric and Symmetric encryption. The data is encrypted using random Key and
+    /// IV with AES-symmetric encryption. Random IV ensures that same plain text produces different
+    /// cipher-texts for each fresh symmetric encryption. The Key and IV are then asymmetrically
+    /// enrypted using Public-MAID and the whole thing is then serialised into a single Vec<u8>.
     pub fn hybrid_encrypt(&self,
                           data_to_encrypt: &[u8],
                           nonce_opt: Option<::sodiumoxide::crypto::asymmetricbox::Nonce>) -> Result<Vec<u8>, ::crypto::symmetriccipher::SymmetricCipherError> {
@@ -281,6 +380,7 @@ impl Client {
         Ok(encoder.into_bytes())
     }
 
+    /// Reverse of hybrid_encrypt. Refer hybrid_encrypt.
     pub fn hybrid_decrypt(&self,
                           data_to_decrypt: &[u8],
                           nonce_opt: Option<::sodiumoxide::crypto::asymmetricbox::Nonce>) -> Option<Vec<u8>> {
@@ -345,10 +445,12 @@ impl Client {
         }
     }
 
+    /// Owner of this client is the name of Public-MAID
     pub fn get_owner(&self) -> routing::NameType {
         self.account.get_public_maid().name()
     }
 
+    /// Put data onto the network. This is non-blocking.
     pub fn put<T>(&mut self, sendable: T) -> Result<response_getter::ResponseGetter, ::IoError> where T: Sendable {
         match self.routing.lock().unwrap().put(sendable) {
             Ok(id)      => Ok(response_getter::ResponseGetter::new(self.response_notifier.clone(), self.callback_interface.clone(), Some(id), None)),
@@ -356,8 +458,12 @@ impl Client {
         }
     }
 
+    /// Get data from the network. This is non-blocking. Additionally this incorporates a mechanism
+    /// of local caching. So if data already exists in the local cache, it is immediately returned
+    /// via ResponseGetter and no networking penatly is payed. The functionality is abstracted to
+    /// the user and is baked entirely into ResponseGetter.
     pub fn get(&mut self, tag_id: u64, name: routing::NameType) -> Result<response_getter::ResponseGetter, ::IoError> {
-        let immutable_data_tag = ImmutableDataTypeTag;
+        let immutable_data_tag = maidsafe_types::data::ImmutableDataTypeTag;
         if tag_id == immutable_data_tag.type_tag() {
             let mut cb_interface = self.callback_interface.lock().unwrap();
             if cb_interface.cache_check(&name) {
@@ -385,64 +491,127 @@ impl Drop for Client {
     }
 }
 
+/////////////////////////////////////////////////////////////////
+/// Helper Struct
+/////////////////////////////////////////////////////////////////
+
+struct SessionPacketEncryptionKeys {
+    password: Vec<u8>,
+    pin: u32,
+}
+
+impl SessionPacketEncryptionKeys {
+    fn new(password: &[u8], pin: u32) -> SessionPacketEncryptionKeys {
+        let vec: Vec<u8> = password.iter().map(|a| *a).collect();
+        SessionPacketEncryptionKeys {
+            password: vec,
+            pin: pin,
+        }
+    }
+
+    fn get_password(&self) -> &[u8] {
+        &self.password[..]
+    }
+
+    fn get_pin(&self) -> u32 {
+        self.pin
+    }
+}
+
+/////////////////////////////////////////////////////////////////
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn account_creation() {
-        let keyword = "Spandan".to_string();
-        let password = "Sharma".as_bytes();
-        let pin = 1234u32;
-        let data_store = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new()));
-        let result = Client::create_account(&keyword, pin, &password, data_store);
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
+        let result = Client::create_account(&keyword, pin, &password);
         assert!(result.is_ok());
     }
 
     #[test]
     fn account_login() {
-        let keyword = "Spandan".to_string();
-        let password = "Sharma".as_bytes();
-        let pin = 1234u32;
-        let data_store = ::client::non_networking_test_framework::get_new_data_store();
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
 
         // Without Creation Login Should Fail
-        let mut result = Client::log_in(&keyword, pin, &password, data_store.clone());
+        let mut result = Client::log_in(&keyword, pin, &password);
         assert!(result.is_err());
 
         // Creation should pass
-        result = Client::create_account(&keyword, pin, &password, data_store.clone());
+        result = Client::create_account(&keyword, pin, &password);
         assert!(result.is_ok());
 
         // Wrong Credentials (Password) - Login should Fail
-        let wrong_password = "sharma".as_bytes();
-        result = Client::log_in(&keyword, pin, &wrong_password, data_store.clone());
+        let wrong_password = "Spandan".to_string();
+        assert!(password != wrong_password);
+        result = Client::log_in(&keyword, pin, &wrong_password);
         assert!(result.is_err());
 
         // Wrong Credentials (Keyword) - Login should Fail
-        let wrong_keyword = "spandan".to_string();
-        result = Client::log_in(&wrong_keyword, pin, &password, data_store.clone());
+        let wrong_keyword = "Spandan".to_string();
+        assert!(keyword != wrong_keyword);
+        result = Client::log_in(&wrong_keyword, pin, &password);
         assert!(result.is_err());
 
         // Wrong Credentials (Pin) - Login should Fail
-        let wrong_pin = 1233;
-        result = Client::log_in(&keyword, wrong_pin, &password, data_store.clone());
+        let wrong_pin = if pin == 0 {
+            pin + 1
+        } else {
+            pin - 1
+        };
+        result = Client::log_in(&keyword, wrong_pin, &password);
         assert!(result.is_err());
 
         // Correct Credentials - Login Should Pass
-        result = Client::log_in(&keyword, pin, &password, data_store);
+        result = Client::log_in(&keyword, pin, &password);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn root_dir_id_creation() {
+        // Construct Client
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
+
+        let result = Client::create_account(&keyword, pin, &password);
+        assert!(result.is_ok());
+        let mut client = result.ok().unwrap();
+
+        assert!(client.get_root_directory_id().is_none());
+
+        let root_dir_id = ::routing::NameType::new([99u8; 64]);
+        match client.set_root_directory_id(root_dir_id.clone()) {
+            Ok(_) => {
+                // Correct Credentials - Login Should Pass
+                let result = Client::log_in(&keyword, pin, &password);
+                assert!(result.is_ok());
+
+                let client = result.ok().unwrap();
+
+                assert!(client.get_root_directory_id().is_some());
+
+                assert_eq!(*client.get_root_directory_id().unwrap(), root_dir_id);
+            },
+            Err(io_err) => panic!("{:?}", io_err.description()),
+        }
     }
 
     #[test]
     fn hybrid_encryption_decryption() {
         // Construct Client
-        let keyword = "Spandan".to_string();
-        let password = "Sharma".as_bytes();
-        let pin = 1234u32;
-        let data_store = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new()));
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
 
-        let result = Client::create_account(&keyword, pin, &password, data_store);
+        let result = Client::create_account(&keyword, pin, &password);
         assert!(result.is_ok());
         let client = result.ok().unwrap();
 

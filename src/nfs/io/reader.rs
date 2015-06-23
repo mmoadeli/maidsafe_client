@@ -14,12 +14,16 @@
 //
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
+
 use nfs;
 use std::sync;
 use super::network_storage::NetworkStorage;
 use self_encryption;
 use client;
 
+#[allow(dead_code)]
+/// Reader is used to read contents of a File. It can read in chunks if the file happens to be very
+/// large
 pub struct Reader {
     file: nfs::file::File,
     self_encryptor: self_encryption::SelfEncryptor<NetworkStorage>,
@@ -27,9 +31,9 @@ pub struct Reader {
 }
 
 impl Reader {
-
+    /// Create a new instance of Reader
     pub fn new(file: nfs::file::File,
-        client: ::std::sync::Arc<::std::sync::Mutex<client::Client>>) -> Reader {
+               client: ::std::sync::Arc<::std::sync::Mutex<client::Client>>) -> Reader {
         let storage = sync::Arc::new(NetworkStorage::new(client.clone()));
         Reader {
             file: file.clone(),
@@ -38,15 +42,16 @@ impl Reader {
         }
     }
 
+    /// Returns the total size of the file/blob
     pub fn size(&self) -> u64 {
         self.self_encryptor.len()
     }
 
+    /// Read data from file/blob
     pub fn read(&mut self,  position: u64, length: u64) -> Result<Vec<u8>, String> {
         if (position + length) > self.size() {
             return Err("Invalid range specified".to_string());
         }
         Ok(self.self_encryptor.read(position, length))
     }
-
 }

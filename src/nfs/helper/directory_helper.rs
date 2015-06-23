@@ -14,6 +14,7 @@
 //
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
+
 use nfs;
 use maidsafe_types;
 use routing;
@@ -37,11 +38,12 @@ impl DirectoryHelper {
 
     /// Creates a Directory in the network.
     pub fn create(&mut self,
-        directory_name: String,
-        user_metadata: Vec<u8>) -> Result<::routing::NameType, String> {
+                  directory_name: String,
+                  user_metadata: Vec<u8>) -> Result<::routing::NameType, String> {
         let directory = nfs::directory_listing::DirectoryListing::new(directory_name, user_metadata);
-        let mut sdv: maidsafe_types::StructuredData = maidsafe_types::StructuredData::new(directory.get_id().clone(), self.client.lock().unwrap().get_owner(),
-            Vec::new());
+        let mut sdv: maidsafe_types::StructuredData = maidsafe_types::StructuredData::new(directory.get_id().clone(),
+                                                                                          self.client.lock().unwrap().get_owner(),
+                                                                                          Vec::new());
         match self.save_directory(&mut sdv, &directory) {
             Ok(_) => Ok(directory.get_id().clone()),
             Err(err) => Err(err)
@@ -50,7 +52,7 @@ impl DirectoryHelper {
 
     /// Updates an existing DirectoryListing in the network.
     pub fn update(&mut self, directory: &nfs::directory_listing::DirectoryListing) -> Result<(), String> {
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
         match self.network_get(structured_data_type_id.type_tag(), directory.get_id()) {
             Ok(serialised_sdv) => {
                 let mut sdv: maidsafe_types::StructuredData = nfs::utils::deserialise(serialised_sdv);
@@ -62,7 +64,7 @@ impl DirectoryHelper {
 
     /// Return the versions of the directory
     pub fn get_versions(&mut self, directory_id: &routing::NameType) -> Result<Vec<routing::NameType>, String> {
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
         match self.network_get(structured_data_type_id.type_tag(), directory_id) {
             Ok(serialised_sdv) => {
                 let sdv: maidsafe_types::StructuredData = nfs::utils::deserialise(serialised_sdv);
@@ -74,9 +76,9 @@ impl DirectoryHelper {
 
     /// Return the DirectoryListing for the specified version
     pub fn get_by_version(&mut self,
-        directory_id: &routing::NameType,
-        version: &routing::NameType) -> Result<nfs::directory_listing::DirectoryListing, String> {
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+                          directory_id: &routing::NameType,
+                          version: &routing::NameType) -> Result<nfs::directory_listing::DirectoryListing, String> {
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
         match self.network_get(structured_data_type_id.type_tag(), directory_id) {
             Ok(serialised_sdv) => {
                 let sdv: maidsafe_types::StructuredData = nfs::utils::deserialise(serialised_sdv);
@@ -93,8 +95,7 @@ impl DirectoryHelper {
 
     /// Return the DirectoryListing for the latest version
     pub fn get(&mut self, directory_id: &routing::NameType) -> Result<nfs::directory_listing::DirectoryListing, String> {
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
-        let _ = self.network_get(structured_data_type_id.type_tag(), directory_id);
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;        
         match self.network_get(structured_data_type_id.type_tag(), directory_id) {
             Ok(serialised_sdv) => {
                 let sdv: maidsafe_types::StructuredData = nfs::utils::deserialise(serialised_sdv);
@@ -145,7 +146,7 @@ impl DirectoryHelper {
 
     fn get_directory_version(&self, directory_id: &::routing::NameType,
         version: &::routing::NameType) -> Result<nfs::directory_listing::DirectoryListing, String> {
-        let immutable_data_type_id: maidsafe_types::data::ImmutableDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let immutable_data_type_id = maidsafe_types::data::ImmutableDataTypeTag;
         match self.network_get(immutable_data_type_id.type_tag(), &version) {
             Ok(serialised_data) => {
                 let imm: maidsafe_types::ImmutableData = nfs::utils::deserialise(serialised_data);
@@ -200,28 +201,25 @@ impl DirectoryHelper {
         }
         Some(::sodiumoxide::crypto::asymmetricbox::Nonce(nonce))
     }
-
 }
-
 
 #[cfg(test)]
 mod test {
     use super::*;
 
-    fn get_dummy_client() -> ::client::Client {
-        let keyword = "Spandan".to_string();
-        let password = "Sharma".as_bytes();
-        let pin = 1234u32;
+    fn get_new_client() -> ::client::Client {
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
 
         ::client::Client::create_account(&keyword,
                                          pin,
-                                         &password,
-                                         ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new()))).ok().unwrap()
+                                         &password).ok().unwrap()
     }
 
     #[test]
     fn create_dir_listing() {
-        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_dummy_client()));
+        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_new_client()));
         let mut dir_helper = DirectoryHelper::new(client.clone());
 
         assert!(dir_helper.create("DirName".to_string(),
@@ -230,10 +228,9 @@ mod test {
 
     #[test]
     fn get_dir_listing() {
-        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_dummy_client()));
+        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_new_client()));
         let mut dir_helper = DirectoryHelper::new(client.clone());
 
-        let parent_id = ::routing::NameType::new([8u8; 64]);
         let created_dir_id: _;
         {
             let put_result = dir_helper.create("DirName".to_string(),
@@ -254,7 +251,7 @@ mod test {
 
     #[test]
     fn update_and_versioning() {
-        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_dummy_client()));
+        let client = ::std::sync::Arc::new(::std::sync::Mutex::new(get_new_client()));
         let mut dir_helper = DirectoryHelper::new(client.clone());
 
         let created_dir_id: _;
@@ -283,7 +280,7 @@ mod test {
         assert_eq!(versions.len(), 1);
 
         {
-            dir_listing.set_name("NewName".to_string());
+            dir_listing.get_mut_metadata().set_name("NewName".to_string());
             let update_result = dir_helper.update(&dir_listing);
             assert!(update_result.is_ok());
         }
@@ -312,7 +309,7 @@ mod test {
             let rxd_dir_listing = get_result.ok().unwrap();
 
             assert!(rxd_dir_listing != dir_listing);
-            assert_eq!(*rxd_dir_listing.get_name(), "DirName2".to_string());
+            assert_eq!(*rxd_dir_listing.get_metadata().get_name(), "DirName2".to_string());
         }
     }
 }

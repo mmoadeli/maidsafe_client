@@ -15,6 +15,8 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+#![allow(unsafe_code)]
+
 use routing;
 use maidsafe_types::TypeTag;
 use routing::sendable::Sendable;
@@ -22,30 +24,49 @@ use routing::client_interface::Interface;
 
 use client::callback_interface;
 
-pub type DataStore = ::std::sync::Arc<::std::sync::Mutex<::std::collections::BTreeMap<routing::NameType, Vec<u8>>>>;
+type DataStore = ::std::sync::Arc<::std::sync::Mutex<::std::collections::BTreeMap<routing::NameType, Vec<u8>>>>;
 
-pub fn get_new_data_store() -> DataStore {
-    ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new()))
+struct PersistentStorageSimulation {
+    data_store: DataStore,
 }
 
+fn get_storage() -> DataStore {
+    static mut STORAGE: *const PersistentStorageSimulation = 0 as *const PersistentStorageSimulation;
+    static mut ONCE: ::std::sync::Once = ::std::sync::ONCE_INIT;
+
+    unsafe {
+        ONCE.call_once(|| {
+            STORAGE = ::std::mem::transmute(Box::new(
+                    PersistentStorageSimulation {
+                        data_store: ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new())),
+                    }
+                    ));
+        });
+
+        (*STORAGE).data_store.clone()
+    }
+}
+
+/// RoutingClient Mock mimics routing interface to store data locally for testing instead of actual
+/// networking with vaults etc.
 pub struct RoutingClientMock {
     callback_interface: ::std::sync::Arc<::std::sync::Mutex<callback_interface::CallbackInterface>>,
-    data_store: DataStore,
     msg_id: routing::types::MessageId,
     network_delay_ms: u32,
 }
 
 impl RoutingClientMock {
+    /// Create a new instance of RoutingClientMock
     pub fn new(cb_interface: ::std::sync::Arc<::std::sync::Mutex<callback_interface::CallbackInterface>>,
-               data_store: DataStore) -> RoutingClientMock {
+               _: routing::types::Id) -> RoutingClientMock {
         RoutingClientMock {
             callback_interface: cb_interface,
-            data_store: data_store,
             msg_id: 1,
             network_delay_ms: 1000,
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_network_delay_for_delay_simulation(&mut self, delay_ms: u32) {
         self.network_delay_ms = delay_ms;
     }
@@ -55,11 +76,11 @@ impl RoutingClientMock {
         let msg_id = self.msg_id;
         let delay_ms = self.network_delay_ms;
         let cb_interface = self.callback_interface.clone();
-        let data_store = self.data_store.clone();
+        let data_store = get_storage();
 
         ::std::thread::spawn(move || {
             ::std::thread::sleep_ms(delay_ms);
-            match data_store.lock().unwrap().get(&name) {
+            match data_store.lock().unwrap().get(&name).clone() {
                 Some(data) => cb_interface.lock().unwrap().handle_get_response(msg_id, Ok(data.clone())),
                 None => cb_interface.lock().unwrap().handle_get_response(msg_id, Err(routing::error::ResponseError::NoData)),
             };
@@ -68,14 +89,14 @@ impl RoutingClientMock {
         Ok(self.msg_id)
     }
 
-    pub fn put<T>(&mut self, sendable: T) -> Result<routing::types::MessageId, ::IoError> where T: routing::sendable::Sendable {
+    pub fn put<T>(&mut self, sendable: T) -> Result<routing::types::MessageId, ::IoError> where T: Sendable {
         self.msg_id += 1;
         let msg_id = self.msg_id;
         let delay_ms = self.network_delay_ms;
         let cb_interface = self.callback_interface.clone();
-        let data_store = self.data_store.clone();
+        let data_store = get_storage();
 
-        let structured_data_type_id: ::maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let structured_data_type_id = ::maidsafe_types::data::StructuredDataTypeTag;
         let success: bool = if sendable.type_tag() != structured_data_type_id.type_tag() && data_store.lock().unwrap().contains_key(&sendable.name()) {
             false
         } else {
@@ -100,9 +121,9 @@ impl RoutingClientMock {
         let msg_id = self.msg_id;
         let delay_ms = self.network_delay_ms;
         let cb_interface = self.callback_interface.clone();
-        let data_store = self.data_store.clone();
+        let data_store = get_storage();
 
-        let structured_data_type_id: ::maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let structured_data_type_id = ::maidsafe_types::data::StructuredDataTypeTag;
         let success: bool = if sendable.type_tag() != structured_data_type_id.type_tag() && data_store.lock().unwrap().contains_key(&sendable.name()) {
             false
         } else {
@@ -123,7 +144,23 @@ impl RoutingClientMock {
     }
 
     pub fn run(&mut self) {
-        ;
+        // let data_store = get_storage();
+        // println!("Amount Of Chunks Stored: {:?}", data_store.lock().unwrap().len());
+    }
+
+    pub fn bootstrap(&mut self,
+                     endpoints: Option<Vec<::routing::routing_client::Endpoint>>,
+                     _: Option<u16>) -> Result<(), routing::error::RoutingError> {
+        match endpoints {
+            Some(vec_endpoints) => {
+                for endpoint in vec_endpoints {
+                    println!("Endpoint: {:?}", endpoint);
+                }
+
+                Ok(())
+            },
+            None => Ok(()),
+        }
     }
 }
 
@@ -143,7 +180,10 @@ mod test {
         let account_packet = ::client::user_account::Account::new(None);
         let callback_interface = ::std::sync::Arc::new(::std::sync::Mutex::new(::client::callback_interface::CallbackInterface::new(notifier.clone())));
 
-        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), get_new_data_store())));
+        let id_packet = ::routing::types::Id::with_keys(account_packet.get_maid().public_keys().clone(),
+                                                      account_packet.get_maid().secret_keys().clone());
+
+        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), id_packet)));
         let mock_routing_clone = mock_routing.clone();
 
         let mock_routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
@@ -208,9 +248,13 @@ mod test {
     #[test]
     fn check_put_and_get_for_immutable_data() {
         let notifier = ::std::sync::Arc::new((::std::sync::Mutex::new(0), ::std::sync::Condvar::new()));
+        let account_packet = ::client::user_account::Account::new(None);
         let callback_interface = ::std::sync::Arc::new(::std::sync::Mutex::new(::client::callback_interface::CallbackInterface::new(notifier.clone())));
 
-        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), get_new_data_store())));
+        let id_packet = ::routing::types::Id::with_keys(account_packet.get_maid().public_keys().clone(),
+                                                      account_packet.get_maid().secret_keys().clone());
+
+        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), id_packet)));
         let mock_routing_clone = mock_routing.clone();
 
         let mock_routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
@@ -239,7 +283,7 @@ mod test {
         };
 
         // Construct ImmutableData
-        let immutable_data_type_id: maidsafe_types::data::ImmutableDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let immutable_data_type_id = maidsafe_types::data::ImmutableDataTypeTag;
         let orig_data: Vec<u8> = (0u8..100u8).map(|_| ::rand::random::<u8>()).collect();
         let orig_immutable_data = maidsafe_types::ImmutableData::new(orig_data);
 
@@ -313,7 +357,10 @@ mod test {
         let account_packet = ::client::user_account::Account::new(None);
         let callback_interface = ::std::sync::Arc::new(::std::sync::Mutex::new(::client::callback_interface::CallbackInterface::new(notifier.clone())));
 
-        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), get_new_data_store())));
+        let id_packet = ::routing::types::Id::with_keys(account_packet.get_maid().public_keys().clone(),
+                                                      account_packet.get_maid().secret_keys().clone());
+
+        let mock_routing = ::std::sync::Arc::new(::std::sync::Mutex::new(RoutingClientMock::new(callback_interface.clone(), id_packet)));
         let mock_routing_clone = mock_routing.clone();
 
         let mock_routing_stop_flag = ::std::sync::Arc::new(::std::sync::Mutex::new(false));
@@ -342,14 +389,14 @@ mod test {
         };
 
         // Construct ImmutableData
-        let immutable_data_type_id: maidsafe_types::data::ImmutableDataTypeTag = unsafe { ::std::mem::uninitialized() };
+        let immutable_data_type_id = maidsafe_types::data::ImmutableDataTypeTag;
         let orig_data: Vec<u8> = (0u8..100u8).map(|_| ::rand::random::<u8>()).collect();
         let orig_immutable_data = maidsafe_types::ImmutableData::new(orig_data);
 
         // Construct StructuredData, 1st version, for this ImmutableData
-        let structured_data_type_id: maidsafe_types::data::StructuredDataTypeTag = unsafe { ::std::mem::uninitialized() };
-        let keyword = "Spandan".to_string();
-        let pin = 1234u32;
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
+        let keyword = (0..100).map(|_| ::rand::random::<char>()).collect();
+        let pin = ::rand::random::<u32>() % 10000u32;
         let user_id = ::client::user_account::Account::generate_network_id(&keyword, pin);
         let mut account_version = maidsafe_types::StructuredData::new(user_id.clone(),
                                                                       account_packet.get_public_maid().name(),

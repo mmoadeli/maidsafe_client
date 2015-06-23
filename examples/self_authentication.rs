@@ -19,23 +19,6 @@ extern crate maidsafe_client;
 
 use std::error::Error;
 
-fn validate_pin_is_4_digits(mut pin: u32) -> bool {
-    for _ in 0..3 {
-        pin /= 10;
-        if pin == 0 {
-            return false;
-        }
-    }
-
-    pin /= 10;
-
-    if pin != 0 {
-        false
-    } else {
-        true
-    }
-}
-
 #[allow(unused_must_use)]
 fn main() {
     let mut keyword = String::new();
@@ -56,24 +39,19 @@ fn main() {
         println!("\n\n--------- Enter PIN (4 Digits) -----------");
         std::io::stdin().read_line(&mut pin_str);
         let result = pin_str.trim().parse::<u32>();
-        if result.is_ok() {
+        if result.is_ok() && pin_str.trim().len() == 4 {
             pin = result.ok().unwrap();
-            if validate_pin_is_4_digits(pin) {
-                break;
-            }
+            break;
         }
         println!("ERROR: PIN is not 4 Digits !!");
         pin_str.clear();
     }
 
-    //TODO Not to be used if not using non_networking_test_framework.
-    let data_store = maidsafe_client::client::non_networking_test_framework::get_new_data_store();
-
     // Account Creation
     {
         println!("\nTrying to create an account ...");
 
-        match maidsafe_client::client::Client::create_account(&keyword, pin, &password.as_bytes(), data_store.clone()) {
+        match maidsafe_client::client::Client::create_account(&keyword, pin, &password) {
             Ok(_) => println!("Account Created Successfully !!"),
             Err(io_error)  => println!("Account Creation Failed !! Reason: {:?}", io_error.description()),
         }
@@ -85,7 +63,7 @@ fn main() {
     // Log into the created account
     {
         println!("\nTrying to log into the created account using supplied credentials ...");
-        match maidsafe_client::client::Client::log_in(&keyword, pin, &password.as_bytes(), data_store.clone()) {
+        match maidsafe_client::client::Client::log_in(&keyword, pin, &password) {
             Ok(_) => println!("Account Login Successful !!"),
             Err(io_error)  => println!("Account Login Failed !! Reason: {:?}", io_error.description()),
         }
@@ -109,11 +87,9 @@ fn main() {
             println!("\n\n--------- Enter PIN (4 Digits) -----------");
             std::io::stdin().read_line(&mut pin_str);
             let result = pin_str.trim().parse::<u32>();
-            if result.is_ok() {
+            if result.is_ok() && pin_str.trim().len() == 4 {
                 pin = result.ok().unwrap();
-                if validate_pin_is_4_digits(pin) {
-                    break;
-                }
+                break;
             }
             println!("ERROR: PIN is not 4 Digits !!");
         }
@@ -121,7 +97,7 @@ fn main() {
         // Log into the created account
         {
             println!("\nTrying to log in ...");
-            match maidsafe_client::client::Client::log_in(&keyword, pin, &password.as_bytes(), data_store.clone()) {
+            match maidsafe_client::client::Client::log_in(&keyword, pin, &password) {
                 Ok(_) => {
                     println!("Account Login Successful !!");
                     break;

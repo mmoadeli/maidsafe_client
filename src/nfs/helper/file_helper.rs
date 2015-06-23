@@ -14,9 +14,9 @@
 //
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
+
 use time;
 use nfs;
-use nfs::helper::directory_helper::DirectoryHelper;
 use routing;
 use client;
 use self_encryption;
@@ -34,24 +34,28 @@ impl FileHelper {
         }
     }
 
+    /// Helper function to create a file in a directory listing
+    /// A writer object is returned, through which the data for the file can be written to the network
+    /// The file is actually saved in the directory listing only after `writer.close()` is invoked
     pub fn create(&mut self,
-        name: String, size: u64,
-        user_metatdata: Vec<u8>,
-        directory: &nfs::directory_listing::DirectoryListing) -> Result<nfs::io::Writer, String> {
+                  name: String,
+                  user_metatdata: Vec<u8>,
+                  directory: &nfs::directory_listing::DirectoryListing) -> Result<nfs::io::Writer, String> {
         match self.file_exists(directory, &name) {
             Some(_) => Err("File already exists".to_string()),
             None => {
-                let mut metadata = nfs::metadata::Metadata::new(name, user_metatdata);
-                metadata.set_size(size);
-                let file = nfs::file::File::new(metadata, self_encryption::datamap::DataMap::None);
+                let file = nfs::file::File::new(nfs::metadata::Metadata::new(name, user_metatdata), self_encryption::datamap::DataMap::None);
                 Ok(nfs::io::Writer::new(directory.clone(), file, self.client.clone()))
             }
         }
     }
 
+    /// Helper function to Update content of a file in a directory listing
+    /// A writer object is returned, through which the data for the file can be written to the network
+    /// The file is actually saved in the directory listing only after `writer.close()` is invoked
     pub fn update(&mut self,
-        file: &nfs::file::File,
-        directory: &nfs::directory_listing::DirectoryListing) -> Result<nfs::io::Writer, String> {
+                  file: &nfs::file::File,
+                  directory: &nfs::directory_listing::DirectoryListing) -> Result<nfs::io::Writer, String> {
         match self.file_exists(directory, file.get_name()) {
             Some(_) => Ok(nfs::io::Writer::new(directory.clone(), file.clone(), self.client.clone())),
             None => Err("File not present in the directory".to_string())
@@ -60,9 +64,9 @@ impl FileHelper {
 
     /// Updates the file metadata. Returns the updated DirectoryListing
     pub fn update_metadata(&mut self,
-        file: &mut nfs::file::File,
-        directory: &mut nfs::directory_listing::DirectoryListing,
-        user_metadata: &Vec<u8>) -> Result<(), String> {
+                           file: &mut nfs::file::File,
+                           directory: &mut nfs::directory_listing::DirectoryListing,
+                           user_metadata: &Vec<u8>) -> Result<(), String> {
         match self.file_exists(directory, file.get_name()) {
             Some(_) => {
                 file.get_mut_metadata().set_user_metadata(user_metadata.clone());
@@ -79,10 +83,10 @@ impl FileHelper {
 
     /// Return the versions of a directory containing modified versions of a file
     pub fn get_versions(&mut self,
-        directory_id: &routing::NameType,
-        file: &nfs::file::File) -> Result<Vec<routing::NameType>, String> {
+                        directory_id: &routing::NameType,
+                        file: &nfs::file::File) -> Result<Vec<routing::NameType>, String> {
         let mut versions = Vec::<routing::NameType>::new();
-        let mut directory_helper = DirectoryHelper::new(self.client.clone());
+        let mut directory_helper = nfs::helper::DirectoryHelper::new(self.client.clone());
 
         match directory_helper.get_versions(directory_id) {
             Ok(sdv_versions) => {
@@ -99,7 +103,7 @@ impl FileHelper {
                                 },
                                 None => ()
                             }
-                        }
+                        },
                         Err(_) => { () }
                     }
                 }
@@ -110,11 +114,13 @@ impl FileHelper {
         Ok(versions)
     }
 
-    pub fn read(&mut self, file: nfs::file::File) -> nfs::io::Reader {
-        nfs::io::Reader::new(file, self.client.clone())
-    }
+    // pub fn read(&mut self, file: nfs::file::File) -> nfs::io::Reader {
+    //     nfs::io::Reader::new(file, self.client.clone())
+    // }
 
-    fn file_exists(&self, directory: &nfs::directory_listing::DirectoryListing, file_name: &String) -> Option<String> {
+    fn file_exists(&self,
+                   directory: &nfs::directory_listing::DirectoryListing,
+                   file_name: &String) -> Option<String> {
         let result = directory.get_files().iter().find(|file| {
                 *file.get_name() == *file_name
             });
@@ -128,18 +134,18 @@ impl FileHelper {
 
 #[cfg(test)]
 mod test {
+    use nfs;
     use super::*;
     use ::std::ops::Index;
 
     fn get_dummy_client() -> ::client::Client {
-        let keyword = "Spandan".to_string();
-        let password = "Sharma".as_bytes();
-        let pin = 1234u32;
+        let keyword = ::utility::generate_random_string(10);
+        let password = ::utility::generate_random_string(10);
+        let pin = ::utility::generate_random_pin();
 
         ::client::Client::create_account(&keyword,
                                          pin,
-                                         &password,
-                                         ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::BTreeMap::new()))).ok().unwrap()
+                                         &password).ok().unwrap()
     }
 
 
@@ -164,10 +170,10 @@ mod test {
             dir_listing = get_result.ok().unwrap();
         }
 
-        let mut file_helper = FileHelper::new(client);
+        let mut file_helper = FileHelper::new(client.clone());
         let mut writer: _;
         {
-            let result = file_helper.create("Name".to_string(), 0, vec![98u8; 100], &dir_listing);
+            let result = file_helper.create("Name".to_string(), vec![98u8; 100], &dir_listing);
             assert!(result.is_ok());
 
             writer = result.ok().unwrap();
@@ -175,7 +181,7 @@ mod test {
 
         let data = vec![12u8; 20];
         writer.write(&data[..], 0);
-        writer.close();
+        let _ = writer.close();
 
         {
             let get_result = dir_helper.get(&created_dir_id);
@@ -189,7 +195,7 @@ mod test {
 
             let file = result[0].clone();
 
-            let mut reader = file_helper.read(file);
+            let mut reader = nfs::io::Reader::new(file.clone(), client.clone());
             let rxd_data = reader.read(0, data.len() as u64).ok().unwrap();
 
             assert_eq!(rxd_data, data);
@@ -205,7 +211,7 @@ mod test {
 
                 let data = vec![11u8; 90];
                 writer.write(&[11u8; 90], 0);
-                writer.close();
+                let _ = writer.close();
 
                 let get_result = dir_helper.get(&created_dir_id);
                 assert!(get_result.is_ok());
@@ -216,7 +222,7 @@ mod test {
 
                 let file = result[0].clone();
 
-                let mut reader = file_helper.read(file.clone());
+                let mut reader =  nfs::io::Reader::new(file.clone(), client.clone());
                 let rxd_data = reader.read(0, data.len() as u64).ok().unwrap();
 
                 assert_eq!(rxd_data, data);
