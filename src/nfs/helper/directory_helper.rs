@@ -95,7 +95,7 @@ impl DirectoryHelper {
 
     /// Return the DirectoryListing for the latest version
     pub fn get(&mut self, directory_id: &routing::NameType) -> Result<nfs::directory_listing::DirectoryListing, String> {
-        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;        
+        let structured_data_type_id = maidsafe_types::data::StructuredDataTypeTag;
         match self.network_get(structured_data_type_id.type_tag(), directory_id) {
             Ok(serialised_sdv) => {
                 let sdv: maidsafe_types::StructuredData = nfs::utils::deserialise(serialised_sdv);
@@ -194,12 +194,12 @@ impl DirectoryHelper {
         }
     }
 
-    fn get_nonce(&self, id: &routing::NameType) -> Option<::sodiumoxide::crypto::asymmetricbox::Nonce> {
+    fn get_nonce(&self, id: &routing::NameType) -> Option<::sodiumoxide::crypto::box_::Nonce> {
         let mut nonce = [0u8;24];
         for i in 0..24 {
             nonce[i] = id.0[i * 2]
         }
-        Some(::sodiumoxide::crypto::asymmetricbox::Nonce(nonce))
+        Some(::sodiumoxide::crypto::box_::Nonce(nonce))
     }
 }
 
